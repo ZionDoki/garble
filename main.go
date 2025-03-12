@@ -61,6 +61,7 @@ var (
 	flagSeed     seedFlag
 	// TODO(pagran): in the future, when control flow obfuscation will be stable migrate to flag
 	flagControlFlow = os.Getenv("GARBLE_EXPERIMENTAL_CONTROLFLOW") == "1"
+	flagMobile      bool
 )
 
 func init() {
@@ -70,6 +71,7 @@ func init() {
 	flagSet.BoolVar(&flagDebug, "debug", false, "Print debug logs to stderr")
 	flagSet.StringVar(&flagDebugDir, "debugdir", "", "Write the obfuscated source to a directory, e.g. -debugdir=out")
 	flagSet.Var(&flagSeed, "seed", "Provide a base64-encoded seed, e.g. -seed=o9WDTZ4CN4w\nFor a random seed, provide -seed=random")
+	flagSet.BoolVar(&flagMobile, "mobile", false, "Use gomobile with 'bind' to create a mobile library")
 }
 
 var rxGarbleFlag = regexp.MustCompile(`-(?:literals|tiny|debug|debugdir|seed)(?:$|=)`)
@@ -129,6 +131,7 @@ Similarly, to combine garble flags and Go build flags:
 The following commands are supported:
 
 	build          replace "go build"
+	mobile         replace "gomobile"
 	test           replace "go test"
 	run            replace "go run"
 	reverse        de-obfuscate output such as stack traces
@@ -256,6 +259,13 @@ func main() {
 	flagSet.Parse(os.Args[1:])
 	log.SetPrefix("[garble] ")
 	log.SetFlags(0) // no timestamps, as they aren't very useful
+
+	err := loadFlagsFromEnv()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to parse flags from env. flags from env: %s", os.Getenv(flagsEnvVar))
+		os.Exit(1)
+	}
+
 	if flagDebug {
 		// TODO: cover this in the tests.
 		log.SetOutput(&uniqueLineWriter{out: os.Stderr})
@@ -275,6 +285,13 @@ func main() {
 	// Print it before we exit.
 	if flagSeed.random {
 		fmt.Fprintf(os.Stderr, "-seed chosen at random: %s\n", base64.RawStdEncoding.EncodeToString(flagSeed.bytes))
+	}
+	executableName := filepath.Base(os.Args[0])
+	if executableName == "go" && isPassThroughCommand(args[0]) {
+		// This binary is being called by gomobile as "go".
+		// Redirect it to the real go binary since the command is not one
+		// that should be handled by garble.
+		os.Exit(redirectToOgGo(os.Args[1:]))
 	}
 	if err := mainErr(args); err != nil {
 		if code, ok := err.(errJustExit); ok {
@@ -337,6 +354,8 @@ garble was built with %q and can't be used with the newer %q; rebuild it with a 
 
 func mainErr(args []string) error {
 	command, args := args[0], args[1:]
+
+	resetPath()
 
 	// Catch users reaching for `go build -toolexec=garble`.
 	if command != "toolexec" && len(args) == 1 && args[0] == "-V=full" {
@@ -444,7 +463,49 @@ func mainErr(args []string) error {
 		cmd.Stderr = os.Stderr
 		log.Printf("calling via toolexec: %s", cmd)
 		return cmd.Run()
+	case "mobile":
+		// ensure gomobile is found in PATH
+		_, err := exec.LookPath("gomobile")
+		if err != nil {
+			return errors.New("gomobile not found in PATH. See https://pkg.go.dev/golang.org/x/mobile/cmd/gomobile for installation instructions.")
+		}
 
+		// ensure gobind is found in PATH
+		_, err = exec.LookPath("gobind")
+		if err != nil {
+			return errors.New("gobind not found in PATH. See https://pkg.go.dev/golang.org/x/mobile/cmd/gomobile for installation instructions.")
+		}
+
+		binDir, err := copyGarbleToTempDirAsGo()
+		if err != nil {
+			return fmt.Errorf("failed to copy garble to temp dir as go: %w", err)
+		}
+		defer os.RemoveAll(binDir)
+
+		goBinaryPath, err := exec.LookPath("go")
+		if err != nil {
+			return errors.New("go not found in PATH")
+		}
+
+		// This env var will be read when redirecting to the real go binary
+		os.Setenv(garbleOgGo, goBinaryPath)
+
+		// Add the tmp dir to the PATH env var so that when gomobile
+		// calls "go build", our binary will be called instead.
+		err = prependToPath(binDir)
+		if err != nil {
+			return fmt.Errorf("unable to modify PATH env var: %w", err)
+		}
+
+		err = saveFlagsToEnv()
+		if err != nil {
+			return errors.New("failed to save flags to env")
+		}
+
+		cmd := exec.Command("gomobile", args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
 	case "toolexec":
 		_, tool := filepath.Split(args[0])
 		if runtime.GOOS == "windows" {
@@ -1924,6 +1985,13 @@ func (tf *transformer) transformGoFile(file *ast.File) *ast.File {
 		if !lpkg.ToObfuscate {
 			return true // we're not obfuscating this package
 		}
+
+		usingGoMobile := os.Getenv(garbleOgGo) != ""
+		// gobind (used by gomobile) requires that exported symbols of the main packages not be obfuscated.
+		if usingGoMobile && lpkg.Module.Main && node.IsExported() {
+			return true
+		}
+
 		hashToUse := lpkg.GarbleActionID
 		debugName := "variable"
 
